@@ -45,7 +45,7 @@
 #elif defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86_FP)))
     #include <emmintrin.h>
 #endif
-
+f
 namespace ujson {
     class Arena;
 }
@@ -2298,7 +2298,7 @@ namespace ujson {
                 return child ? ValueRef {child, arena_} : ValueRef {};
             }
 
-            // build lazily if random access becomes �worth it�
+            // build lazily if random access becomes worth it
             if (!k.index) {
                 // optional heuristic: only build if i is not tiny
                 if (i >= 4u)
@@ -2448,7 +2448,7 @@ namespace ujson {
             return true;
         }
 
-        // ---- ranges ----
+        // ranges
         struct ArrayIter;
         struct ArrayRange;
 
@@ -5084,7 +5084,7 @@ namespace ujson {
         template <class T>
         UJSON_FORCEINLINE NodeRef& operator=(T&& v);
 
-        // ---- object ----
+        // object
         NodeRef operator[](std::string_view key) const; // create-missing as null
         [[nodiscard]] UJSON_FORCEINLINE NodeRef get(std::string_view key) const; // non-creating
         [[nodiscard]] UJSON_FORCEINLINE bool contains(std::string_view key) const;
@@ -5097,7 +5097,7 @@ namespace ujson {
 
         UJSON_FORCEINLINE bool erase(std::string_view key, EraseMode mode = EraseMode::Stable) const;
 
-        // ---- array ----
+        // array
         UJSON_FORCEINLINE NodeRef operator[](std::size_t idx) const; // expand with nulls
         [[nodiscard]] UJSON_FORCEINLINE NodeRef at(std::size_t idx) const; // no expand
 
