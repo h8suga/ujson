@@ -3,12 +3,6 @@
 ![SIMD](https://img.shields.io/badge/SIMD-SSE2%20%7C%20AVX2-orange.svg)
 ![MIT License](https://img.shields.io/badge/license-MIT-green.svg)
 
-# ujson
-
-High-performance single-header modern C++20 JSON parser and builder featuring 256-bit SIMD structural indexing, constexpr classification tables, arena allocation, SAX & DOM APIs, and high-throughput low-allocation design.
-
----
-
 ## Overview
 
 ujson is a modern C++20 JSON library providing:
