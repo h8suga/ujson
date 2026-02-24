@@ -1,5 +1,7 @@
+
 # ujson
-Modern Single-header C++20 JSON parser and builder featuring 256-bit SIMD structural indexing, constexpr classification tables, arena allocation, SAX & DOM APIs, and high-throughput low-allocation design.
+
+Single-header C++20 JSON parser and builder with SIMD-accelerated structural scanning, C++20 Concepts, and custom allocator support.
 
 ---
 
@@ -143,30 +145,6 @@ In typical workflows, allocations are limited to arena growth and string materia
 - Surrogate pairs
 - `\u0000`
 - Validation and decoding
-
----
-
-## Constraints and Behavior
-
-- Maximum depth is configurable via parse/build APIs (default `512`).
-- Strict UTF-8 validation is enabled by default where applicable.
-- String materialization uses arena-backed buffers; large strings are bounded by internal limits.
-
----
-
-## String Ownership and Memory
-
-- `StringPolicy::View` keeps string views into input or arena buffers.
-- `StringPolicy::Copy` materializes strings into arena storage.
-- All DOM allocations are arena-backed for predictable memory behavior.
-
----
-
-## Compiler and Platform Compatibility
-
-- C++20 compilers (MSVC, Clang, GCC).
-- SIMD paths: SSE2 or AVX2 depending on compilation flags.
-- Tested on Windows x64; portable C++20 code for other platforms.
 
 ---
 
