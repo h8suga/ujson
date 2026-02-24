@@ -1,7 +1,7 @@
 
 # ujson
 
-Single-header C++20 JSON parser and builder with SIMD-accelerated structural scanning, C++20 Concepts, and custom allocator support.
+High-performance single-header modern C++20 JSON parser and builder featuring 256-bit SIMD structural indexing, constexpr classification tables, arena allocation, SAX & DOM APIs, and high-throughput low-allocation design.
 
 ---
 
