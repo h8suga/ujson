@@ -1,3 +1,7 @@
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)
+![Header Only](https://img.shields.io/badge/header--only-yes-brightgreen.svg)
+![SIMD](https://img.shields.io/badge/SIMD-SSE2%20%7C%20AVX2-orange.svg)
+![MIT License](https://img.shields.io/badge/license-MIT-green.svg)
 
 # ujson
 
