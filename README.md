@@ -25,6 +25,20 @@ The design targets predictable memory behavior and minimal allocation overhead v
 
 ---
 
+## Lightweight by Design
+
+ujson is designed to minimize:
+
+- Binary size
+- Dynamic allocations
+- Runtime overhead
+- Dependency surface
+
+The entire library is single-header, requires no external dependencies,
+and uses arena-backed storage to keep allocation costs close to the theoretical minimum.
+
+---
+
 ## Features
 
 ### Single Header
