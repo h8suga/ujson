@@ -29,7 +29,6 @@
 #include <type_traits>
 #include <utility>
 
-#include <cstdlib>
 #if defined(_MSC_VER)
     #include <malloc.h>
 #endif
@@ -45,7 +44,7 @@
 #elif defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86_FP)))
     #include <emmintrin.h>
 #endif
-f
+
 namespace ujson {
     class Arena;
 }
@@ -3805,7 +3804,7 @@ fallback_double:
     };
 
     template <bool ShouldCopyInput = false, bool MaterializeStrings = false, bool StrictUtf8 = true>
-    class DocumentT : ArenaHolder {
+    class DocumentT : public ArenaHolder {
     public:
         DocumentT() = default;
 
@@ -4559,7 +4558,7 @@ fallback_double:
     }
 
     template <class Handler>
-    class SaxParser : ArenaHolder {
+    class SaxParser : public ArenaHolder {
     public:
         explicit SaxParser(Handler& h, HasCStringData auto&& s, const std::uint32_t max_depth = 512): ArenaHolder {true}, h_(h), s_ {s.data(), s.size()}, max_depth_(max_depth) { }
         explicit SaxParser(Handler& h, HasCStringData auto&& s, Arena& a, const std::uint32_t max_depth = 512): ArenaHolder {a}, h_(h), s_ {s.data(), s.size()}, max_depth_(max_depth) { }
@@ -4640,7 +4639,7 @@ fallback_double:
         }
     };
 
-    class DomBuilder : ArenaHolder {
+    class DomBuilder : public ArenaHolder {
     public:
         explicit DomBuilder(): ArenaHolder {true} { }
         explicit DomBuilder(Arena& arena): ArenaHolder {arena} { }
@@ -5122,7 +5121,7 @@ namespace ujson {
         explicit NodeRef(ValueBuilder* b, Node** slot, Node* parent): b_(b), slot_(slot), parent_(parent) { }
     };
 
-    class ValueBuilder : ArenaHolder {
+    class ValueBuilder : public ArenaHolder {
     public:
         struct Options {
             StringPolicy strings = StringPolicy::Copy;
