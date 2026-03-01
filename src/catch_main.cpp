@@ -29,6 +29,13 @@ inline std::string bench_environment() {
 }
 
 int main(int argc, char* argv[]) {
-    std::cout << bench_environment() << "\n";
-    return Catch::Session().run(argc, argv);
+    auto session = Catch::Session();
+    session.applyCommandLine(argc, argv);
+
+#ifndef CATCH_CONFIG_DISABLE_BENCHMARKING
+    if (!session.config().skipBenchmarks())
+        std::cout << bench_environment() << "\n";
+#endif
+
+    return session.run(argc, argv);
 }

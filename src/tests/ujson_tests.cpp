@@ -1,4 +1,3 @@
-#include "catch2/benchmark/catch_benchmark.hpp"
 #include "catch2/catch_approx.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -144,90 +143,6 @@ TEST_CASE("decode basic types", "[ujson][basic]") {
     CHECK(root.get("").as_string().empty());
 
     REQUIRE(root.get("k").as_string().empty());
-}
-
-TEST_CASE("ujson parse benchmark scaling", "[ujson][bench][scale]") {
-    static constexpr std::string_view chunk = R"({"b":true,"i":42,"f":3.5,"s":"hello","arr":[1,2,3,4,5,6,7,8],"obj":{"a":1,"b":2,"c":3}})";
-
-    auto make_big = [](int n) {
-        std::string s;
-        s.reserve(static_cast<size_t>(n) * (chunk.size() + 1) + 16);
-        s.push_back('[');
-        for (int i = 0; i < n; ++i) {
-            if (i)
-                s.push_back(',');
-            s.append(chunk);
-        }
-        s.push_back(']');
-        return s;
-    };
-
-    const auto big16 = make_big(16);
-    const auto big64 = make_big(64);
-
-    static constexpr std::size_t kBuf = 512 * 1024;
-    ujson::StaticBufferAllocator<kBuf> alloc;
-    ujson::Arena arena {alloc};
-
-    BENCHMARK("parse DOM x16 (same arena)") {
-        alloc.reset();
-        arena.reset();
-        auto doc = ujson::Document::parse(std::string_view {big16}, arena);
-        REQUIRE(doc.ok());
-        return doc.root().size();
-    };
-
-    BENCHMARK("parse DOM x64 (same arena)") {
-        alloc.reset();
-        arena.reset();
-        auto doc = ujson::Document::parse(std::string_view {big64}, arena);
-        REQUIRE(doc.ok());
-        return doc.root().size();
-    };
-
-    BENCHMARK_ADVANCED("parse DOM x64 (advanced)")(Catch::Benchmark::Chronometer meter) {
-        meter.measure([&] {
-            alloc.reset();
-            arena.reset();
-            auto doc = ujson::Document::parse(std::string_view {big64}, arena);
-            REQUIRE(doc.ok());
-            return doc.root().size();
-        });
-    };
-}
-
-TEST_CASE("ujson parse benchmark (same arena)", "[ujson][bench]") {
-    static constexpr std::string_view json = R"({
-        "b": true,
-        "i": 42,
-        "f": 3.5,
-        "s": "hello",
-        "arr": [1,2,3,4,5,6,7,8],
-        "obj": {"a":1,"b":2,"c":3}
-    })";
-
-    static constexpr std::size_t kBuf = 256 * 1024;
-    ujson::StaticBufferAllocator<kBuf> alloc;
-    ujson::Arena arena {alloc};
-
-    BENCHMARK("parse DOM small (same arena)") {
-        alloc.reset();
-        arena.reset();
-        auto doc = ujson::Document::parse(json, arena);
-        REQUIRE(doc.ok());
-        return doc.root().size();
-    };
-
-    BENCHMARK("validate-only small (same arena)") {
-        alloc.reset();
-        arena.reset();
-
-        ujson::ValidateHandler h {arena};
-        ujson::CoreParser<false, true, ujson::ValidateHandler> p(h, json, 512);
-        const auto err = p.parse_root();
-        REQUIRE(err.ok());
-        return true;
-    };
 }
 
 TEST_CASE("parse arrays", "[ujson]") {
@@ -1175,6 +1090,84 @@ TEST_CASE("String view policy shares lifetime", "[ujson][value_builder][string][
     tmp = "1ello";
 
     REQUIRE(root.get("x").raw()->data.str == "1ello");
+}
+
+TEST_CASE("Encoding policy utf8 stores utf8 bytes", "[ujson][value_builder][encoding][utf8]") {
+    ValueBuilder::Options opt;
+    opt.encoding = EncodingPolicy::Utf8;
+
+    ValueBuilder b(opt);
+    auto root = b.root().set_object();
+
+    const std::u16string s = u"\u00A9\U0001F600";
+    root.add("s", s);
+
+    const std::string expected = "\xC2\xA9\xF0\x9F\x98\x80";
+    REQUIRE(root.get("s").raw()->data.str == expected);
+
+    const std::string out = b.encode();
+    REQUIRE(out == std::string("{\"s\":\"") + expected + "\"}");
+}
+
+TEST_CASE("Encoding policy utf8 escapes control characters", "[ujson][value_builder][encoding][utf8]") {
+    ValueBuilder::Options opt;
+    opt.encoding = EncodingPolicy::Utf8;
+
+    ValueBuilder b(opt);
+    auto root = b.root().set_object();
+
+    root.add("s", std::string_view {"line\n\t\"quoted\"\\slash"});
+
+    const std::string out = b.encode();
+    REQUIRE(out == R"({"s":"line\n\t\"quoted\"\\slash"})");
+}
+
+TEST_CASE("Encoding policy json escaped stores ascii escapes", "[ujson][value_builder][encoding][json]") {
+    ValueBuilder::Options opt;
+    opt.encoding = EncodingPolicy::JsonEscaped;
+
+    ValueBuilder b(opt);
+    auto root = b.root().set_object();
+
+    const std::u16string s = u"\u00A9\U0001F600";
+    root.add("s", s);
+
+    const std::string expected = R"(\u00A9\uD83D\uDE00)";
+    REQUIRE(root.get("s").raw()->data.str == expected);
+
+    const std::string out = b.encode();
+    REQUIRE(out == std::string("{\"s\":\"") + expected + "\"}");
+
+    for (const unsigned char c : out) {
+        REQUIRE(c <= 0x7F);
+    }
+}
+
+TEST_CASE("Encoding policy json escaped handles control characters", "[ujson][value_builder][encoding][json]") {
+    ValueBuilder::Options opt;
+    opt.encoding = EncodingPolicy::JsonEscaped;
+
+    ValueBuilder b(opt);
+    auto root = b.root().set_object();
+
+    const std::u16string u16 = u"line\n\t\"quoted\"\\slash";
+    const std::wstring w = L"line\n\t\"quoted\"\\slash";
+
+    root.add("s", std::string_view {"line\n\t\"quoted\"\\slash"});
+    root.add("u16", u16);
+    root.add("w", w);
+
+    const std::string expected = R"(line\n\t\"quoted\"\\slash)";
+    REQUIRE(root.get("s").raw()->data.str == expected);
+    REQUIRE(root.get("u16").raw()->data.str == expected);
+    REQUIRE(root.get("w").raw()->data.str == expected);
+
+    const std::string out = b.encode();
+    REQUIRE(out == std::string("{\"s\":\"") + expected + "\",\"u16\":\"" + expected + "\",\"w\":\"" + expected + "\"}");
+
+    for (const unsigned char c : out) {
+        REQUIRE(c <= 0x7F);
+    }
 }
 
 TEST_CASE("Nested structure heavy build", "[ujson][value_builder][nested]") {
