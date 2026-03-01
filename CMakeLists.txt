@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if (MSVC)
-    add_compile_options(/WX /MP)
+    add_compile_options(/WX /MP /utf-8)
 else()
     add_compile_options(-Werror)
 endif()

@@ -6254,6 +6254,30 @@ namespace ujson {
         template <class CharT>
         [[nodiscard]] UJSON_FORCEINLINE std::string_view materialize_utf8_bytes(std::basic_string_view<CharT> in) {
             // Utf8 output bytes, stored in arena if needed
+            auto materialize_utf8_from_bytes = [&](const std::string_view sv) -> std::string_view {
+                const bool needs_escape = detail::find_escape_in_string(sv.data(), sv.data() + sv.size()) != sv.data() + sv.size();
+                const std::size_t cap = needs_escape ? sv.size() * 6 + 1 : sv.size() + 1;
+                auto p = static_cast<char*>(arena().alloc(cap, 1));
+                if (!p) {
+                    set_err(ErrorCode::WriterOverflow);
+                    return {};
+                }
+
+                if (needs_escape) {
+                    std::size_t out_len = 0;
+                    if (!detail::json_escape_utf8_control_chars(sv.data(), sv.data() + sv.size(), p, out_len)) {
+                        set_err(ErrorCode::WriterOverflow);
+                        return {};
+                    }
+                    p[out_len] = '\0';
+                    return {p, out_len};
+                }
+
+                std::memcpy(p, sv.data(), sv.size());
+                p[sv.size()] = '\0';
+                return {p, sv.size()};
+            };
+
             if constexpr (std::same_as<CharT, char>) {
                 const std::string_view sv {in.data(), in.size()};
                 const bool needs_escape = detail::find_escape_in_string(sv.data(), sv.data() + sv.size()) != sv.data() + sv.size();
@@ -6309,6 +6333,26 @@ namespace ujson {
                 return {p, sv.size()};
 #endif
             } else {
+                if constexpr (std::same_as<CharT, char16_t> || std::same_as<CharT, char32_t>) {
+                    bool all_bytes = true;
+                    for (const auto ch : in) {
+                        if (static_cast<std::uint32_t>(ch) > 0xFFu) {
+                            all_bytes = false;
+                            break;
+                        }
+                    }
+
+                    if (all_bytes) {
+                        std::string bytes;
+                        bytes.reserve(in.size());
+                        for (const auto ch : in)
+                            bytes.push_back(static_cast<char>(ch));
+
+                        if (detail::validate_utf8_segment(bytes.data(), bytes.data() + bytes.size()))
+                            return materialize_utf8_from_bytes(bytes);
+                    }
+                }
+
                 // wide -> utf8 in arena
                 // worst-case 4 bytes per code unit (safe upper bound)
                 const std::size_t cap = in.size() * 6 + 1;
@@ -6417,6 +6461,32 @@ namespace ujson {
                 }
 #endif
             } else {
+                if constexpr (std::same_as<CharT, char16_t> || std::same_as<CharT, char32_t>) {
+                    bool all_bytes = true;
+                    for (const auto ch : in) {
+                        if (static_cast<std::uint32_t>(ch) > 0xFFu) {
+                            all_bytes = false;
+                            break;
+                        }
+                    }
+
+                    if (all_bytes) {
+                        std::string bytes;
+                        bytes.reserve(in.size());
+                        for (const auto ch : in)
+                            bytes.push_back(static_cast<char>(ch));
+
+                        if (detail::validate_utf8_segment(bytes.data(), bytes.data() + bytes.size())) {
+                            if (!detail::json_escape_utf8_to_ascii(bytes.data(), bytes.data() + bytes.size(), p, out_len)) {
+                                set_err(ErrorCode::InvalidUnicode);
+                                return {};
+                            }
+                            p[out_len] = '\0';
+                            return {p, out_len};
+                        }
+                    }
+                }
+
                 // wide: write escapes directly (no intermediate utf8)
                 char* dst = p;
 
