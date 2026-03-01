@@ -1100,13 +1100,34 @@ TEST_CASE("Encoding policy utf8 stores utf8 bytes", "[ujson][value_builder][enco
     auto root = b.root().set_object();
 
     const std::u16string s = u"\u00A9\U0001F600";
+    const std::u16string u16 = u"\u043F\u0440\u0438\u0432\u0435\u0442";
+    const std::u32string u32 = U"\u043F\u0440\u0438\u0432\u0435\u0442";
+    const std::wstring w = L"\u043F\u0440\u0438\u0432\u0435\u0442";
+    const std::string utf8 = {
+        static_cast<char>(0xD0), static_cast<char>(0xBF), static_cast<char>(0xD1), static_cast<char>(0x80),
+        static_cast<char>(0xD0), static_cast<char>(0xB8), static_cast<char>(0xD0), static_cast<char>(0xB2),
+        static_cast<char>(0xD0), static_cast<char>(0xB5), static_cast<char>(0xD1), static_cast<char>(0x82)
+    };
     root.add("s", s);
+    root.add("utf8", utf8);
+    root.add("u16", u16);
+    root.add("u32", u32);
+    root.add("w", w);
 
     const std::string expected = "\xC2\xA9\xF0\x9F\x98\x80";
     REQUIRE(root.get("s").raw()->data.str == expected);
+    REQUIRE(root.get("utf8").raw()->data.str == utf8);
+    REQUIRE(root.get("u16").raw()->data.str == utf8);
+    REQUIRE(root.get("u32").raw()->data.str == utf8);
+    REQUIRE(root.get("w").raw()->data.str == utf8);
 
     const std::string out = b.encode();
-    REQUIRE(out == std::string("{\"s\":\"") + expected + "\"}");
+    REQUIRE(out == std::string("{\"s\":\"") + expected +
+        "\",\"utf8\":\"" + utf8 +
+        "\",\"u16\":\"" + utf8 +
+        "\",\"u32\":\"" + utf8 +
+        "\",\"w\":\"" + utf8 + "\"}");
+    REQUIRE(out.find("\\u00") == std::string::npos);
 }
 
 TEST_CASE("Encoding policy utf8 escapes control characters", "[ujson][value_builder][encoding][utf8]") {
@@ -1130,13 +1151,34 @@ TEST_CASE("Encoding policy json escaped stores ascii escapes", "[ujson][value_bu
     auto root = b.root().set_object();
 
     const std::u16string s = u"\u00A9\U0001F600";
+    const std::u16string u16 = u"\u043F\u0440\u0438\u0432\u0435\u0442";
+    const std::u32string u32 = U"\u043F\u0440\u0438\u0432\u0435\u0442";
+    const std::wstring w = L"\u043F\u0440\u0438\u0432\u0435\u0442";
+    const std::string utf8 = {
+        static_cast<char>(0xD0), static_cast<char>(0xBF), static_cast<char>(0xD1), static_cast<char>(0x80),
+        static_cast<char>(0xD0), static_cast<char>(0xB8), static_cast<char>(0xD0), static_cast<char>(0xB2),
+        static_cast<char>(0xD0), static_cast<char>(0xB5), static_cast<char>(0xD1), static_cast<char>(0x82)
+    };
     root.add("s", s);
+    root.add("utf8", utf8);
+    root.add("u16", u16);
+    root.add("u32", u32);
+    root.add("w", w);
 
     const std::string expected = R"(\u00A9\uD83D\uDE00)";
+    const std::string expected_utf8 = R"(\u043F\u0440\u0438\u0432\u0435\u0442)";
     REQUIRE(root.get("s").raw()->data.str == expected);
+    REQUIRE(root.get("utf8").raw()->data.str == expected_utf8);
+    REQUIRE(root.get("u16").raw()->data.str == expected_utf8);
+    REQUIRE(root.get("u32").raw()->data.str == expected_utf8);
+    REQUIRE(root.get("w").raw()->data.str == expected_utf8);
 
     const std::string out = b.encode();
-    REQUIRE(out == std::string("{\"s\":\"") + expected + "\"}");
+    REQUIRE(out == std::string("{\"s\":\"") + expected +
+        "\",\"utf8\":\"" + expected_utf8 +
+        "\",\"u16\":\"" + expected_utf8 +
+        "\",\"u32\":\"" + expected_utf8 +
+        "\",\"w\":\"" + expected_utf8 + "\"}");
 
     for (const unsigned char c : out) {
         REQUIRE(c <= 0x7F);

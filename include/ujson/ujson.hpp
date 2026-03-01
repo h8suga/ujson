@@ -1273,7 +1273,7 @@ namespace ujson::detail {
         return dst;
     }
 
-    [[nodiscard]] UJSON_FORCEINLINE bool json_escape_utf8_to_ascii(const char* p, const char* e, char* out, std::size_t& out_len) noexcept {
+    [[nodiscard]] UJSON_FORCEINLINE bool json_escape_utf8_control_chars(const char* p, const char* e, char* out, std::size_t& out_len) noexcept {
         char* dst = out;
 
         while (p < e) {
@@ -1286,17 +1286,32 @@ namespace ujson::detail {
                     break;
             }
 
-            if (const auto c = static_cast<unsigned char>(*p); c < 0x80u) {
-                ++p;
+            const auto c = static_cast<unsigned char>(*p++);
+            if (c < 0x80u) {
                 dst = append_ascii_escaped(dst, c);
-                continue;
+            } else {
+                *dst++ = static_cast<char>(c);
             }
+        }
 
+        out_len = static_cast<std::size_t>(dst - out);
+        return true;
+    }
+
+    [[nodiscard]] UJSON_FORCEINLINE bool json_escape_utf8_to_ascii(const char* p, const char* e, char* out, std::size_t& out_len) noexcept {
+        char* dst = out;
+
+        while (p < e) {
             std::uint32_t cp = 0;
             const char* np = nullptr;
             if (!utf8_next_cp(p, e, np, cp))
                 return false;
             p = np;
+
+            if (cp < 0x80u) {
+                dst = append_ascii_escaped(dst, static_cast<unsigned char>(cp));
+                continue;
+            }
 
             if (cp <= 0xFFFFu) {
                 dst = append_u16_escape(dst, static_cast<std::uint16_t>(cp));
@@ -5615,14 +5630,7 @@ namespace ujson {
             if (!root_ || !ok())
                 return {};
 
-            if (opt_.encoding == EncodingPolicy::JsonEscaped) {
-                detail::JsonWriterCoreImpl<StringSink, detail::StringEscapePolicy::PreEscaped> writer(StringSink {}, pretty, kDefaultMaxDepth, nullptr);
-                if (!writer.write(ValueRef {root_, arena_}))
-                    return {};
-                return writer.finish();
-            }
-
-            detail::JsonWriterCoreImpl<StringSink, detail::StringEscapePolicy::Escape> writer(StringSink {}, pretty, kDefaultMaxDepth, nullptr);
+            detail::JsonWriterCoreImpl<StringSink, detail::StringEscapePolicy::PreEscaped> writer(StringSink {}, pretty, kDefaultMaxDepth, nullptr);
             if (!writer.write(ValueRef {root_, arena_}))
                 return {};
             return writer.finish();
@@ -6248,28 +6256,54 @@ namespace ujson {
             // Utf8 output bytes, stored in arena if needed
             if constexpr (std::same_as<CharT, char>) {
                 const std::string_view sv {in.data(), in.size()};
-                if (opt_.strings == StringPolicy::View)
+                const bool needs_escape = detail::find_escape_in_string(sv.data(), sv.data() + sv.size()) != sv.data() + sv.size();
+                if (!needs_escape && opt_.strings == StringPolicy::View)
                     return sv;
 
-                auto p = static_cast<char*>(arena().alloc(sv.size() + 1, 1));
+                const std::size_t cap = needs_escape ? sv.size() * 6 + 1 : sv.size() + 1;
+                auto p = static_cast<char*>(arena().alloc(cap, 1));
                 if (!p) {
                     set_err(ErrorCode::WriterOverflow);
                     return {};
                 }
+
+                if (needs_escape) {
+                    std::size_t out_len = 0;
+                    if (!detail::json_escape_utf8_control_chars(sv.data(), sv.data() + sv.size(), p, out_len)) {
+                        set_err(ErrorCode::WriterOverflow);
+                        return {};
+                    }
+                    p[out_len] = '\0';
+                    return {p, out_len};
+                }
+
                 std::memcpy(p, sv.data(), sv.size());
                 p[sv.size()] = '\0';
                 return {p, sv.size()};
 #ifdef __cpp_char8_t
             } else if constexpr (std::same_as<CharT, char8_t>) {
                 const std::string_view sv {reinterpret_cast<const char*>(in.data()), in.size()};
-                if (opt_.strings == StringPolicy::View)
+                const bool needs_escape = detail::find_escape_in_string(sv.data(), sv.data() + sv.size()) != sv.data() + sv.size();
+                if (!needs_escape && opt_.strings == StringPolicy::View)
                     return sv;
 
-                auto p = static_cast<char*>(arena().alloc(sv.size() + 1, 1));
+                const std::size_t cap = needs_escape ? sv.size() * 6 + 1 : sv.size() + 1;
+                auto p = static_cast<char*>(arena().alloc(cap, 1));
                 if (!p) {
                     set_err(ErrorCode::WriterOverflow);
                     return {};
                 }
+
+                if (needs_escape) {
+                    std::size_t out_len = 0;
+                    if (!detail::json_escape_utf8_control_chars(sv.data(), sv.data() + sv.size(), p, out_len)) {
+                        set_err(ErrorCode::WriterOverflow);
+                        return {};
+                    }
+                    p[out_len] = '\0';
+                    return {p, out_len};
+                }
+
                 std::memcpy(p, sv.data(), sv.size());
                 p[sv.size()] = '\0';
                 return {p, sv.size()};
@@ -6277,7 +6311,7 @@ namespace ujson {
             } else {
                 // wide -> utf8 in arena
                 // worst-case 4 bytes per code unit (safe upper bound)
-                const std::size_t cap = in.size() * 4 + 1;
+                const std::size_t cap = in.size() * 6 + 1;
                 auto p = static_cast<char*>(arena().alloc(cap, 1));
                 if (!p) {
                     set_err(ErrorCode::WriterOverflow);
@@ -6290,12 +6324,16 @@ namespace ujson {
                 if constexpr (std::same_as<CharT, char32_t>) {
                     for (const char32_t ch : in) {
                         const auto cp = static_cast<std::uint32_t>(ch);
-                        const std::size_t n = ujson::detail::utf8_encode(dst, cp);
-                        if (!n) {
-                            ok = false;
-                            break;
+                        if (cp < 0x80u) {
+                            dst = ujson::detail::append_ascii_escaped(dst, static_cast<unsigned char>(cp));
+                        } else {
+                            const std::size_t n = ujson::detail::utf8_encode(dst, cp);
+                            if (!n) {
+                                ok = false;
+                                break;
+                            }
+                            dst += n;
                         }
-                        dst += n;
                     }
                 } else if constexpr (std::same_as<CharT, char16_t>) {
                     for (std::size_t i = 0; i < in.size(); ++i) {
@@ -6321,12 +6359,16 @@ namespace ujson {
                             cp = w1;
                         }
 
-                        const std::size_t n = ujson::detail::utf8_encode(dst, cp);
-                        if (!n) {
-                            ok = false;
-                            break;
+                        if (cp < 0x80u) {
+                            dst = ujson::detail::append_ascii_escaped(dst, static_cast<unsigned char>(cp));
+                        } else {
+                            const std::size_t n = ujson::detail::utf8_encode(dst, cp);
+                            if (!n) {
+                                ok = false;
+                                break;
+                            }
+                            dst += n;
                         }
-                        dst += n;
                     }
                 } else if constexpr (std::same_as<CharT, wchar_t>) {
                     if constexpr (sizeof(wchar_t) == 2) {
