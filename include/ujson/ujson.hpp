@@ -49,7 +49,36 @@ namespace ujson {
     class Arena;
 }
 
+namespace ujson::concepts {
+    template <class T>
+    using remove_cvref_t = std::remove_cvref_t<T>;
+
+    template <class C>
+    concept text_char = std::same_as<C, char> ||
+#ifdef __cpp_char8_t
+                        std::same_as<C, char8_t> ||
+#endif
+                        std::same_as<C, char16_t> || std::same_as<C, char32_t> || std::same_as<C, wchar_t>;
+
+    template <class T> concept text_array = std::is_array_v<remove_cvref_t<T>> && text_char<std::remove_cv_t<std::remove_extent_t<remove_cvref_t<T>>>>;
+
+    template <class T>
+    concept text_buffer = requires(const remove_cvref_t<T>& v) {
+        typename remove_cvref_t<T>::value_type;
+        requires text_char<typename remove_cvref_t<T>::value_type>;
+        { v.data() } -> std::convertible_to<const remove_cvref_t<T>::value_type*>;
+        { v.size() } -> std::convertible_to<std::size_t>;
+    };
+
+    template <class T> concept text_ptr = std::is_pointer_v<remove_cvref_t<T>> && text_char<std::remove_cv_t<std::remove_pointer_t<remove_cvref_t<T>>>>;
+
+    template <class T> concept string_like = text_array<T> || text_buffer<T> || text_ptr<T>;
+} // namespace ujson::concepts
+
 namespace ujson::detail {
+    enum class StringEscapePolicy : std::uint8_t;
+    template <class Sink, StringEscapePolicy Policy>
+    class JsonWriterCoreImpl;
 
     struct CharMask256 {
         std::uint64_t w[4] {};
@@ -284,15 +313,15 @@ namespace ujson::detail {
 
     [[nodiscard]]
     UJSON_FORCEINLINE std::uint32_t compute_escaped_mask(const std::uint32_t backslash_mask, const bool prev_escaped, bool& out_prev_escaped) noexcept {
-        constexpr std::uint32_t ALL = 0xFFFFu;
-        constexpr std::uint32_t ODD = 0xAAAAu; // bits 1,3,5... within 16 bits
+        constexpr auto ALL = 0xFFFFu;
+        constexpr auto ODD = 0xAAAAu; // bits 1,3,5... within 16 bits
 
         const std::uint32_t bs = backslash_mask & ALL;
-        const std::uint32_t carry = static_cast<std::uint32_t>(prev_escaped);
+        const auto carry = static_cast<std::uint32_t>(prev_escaped);
 
         const std::uint32_t run_start = bs & ~(bs << 1);
 
-        std::uint32_t odd_start = (run_start & ODD) | (carry & (run_start & 1u));
+        const std::uint32_t odd_start = (run_start & ODD) | (carry & (run_start & 1u));
 
         const std::uint32_t m2 = bs & (bs << 1);
         const std::uint32_t m4 = m2 & (m2 << 2);
@@ -1125,8 +1154,378 @@ namespace ujson::detail {
 
 } // namespace ujson::detail
 
-namespace ujson {
+namespace ujson::detail {
+    UJSON_FORCEINLINE bool append_cp(std::string& out, const std::uint32_t cp) {
+        char buf[4];
+        const std::size_t n = utf8_encode(buf, cp);
+        if (!n)
+            return false;
+        out.append(buf, n);
+        return true;
+    }
 
+    [[nodiscard]] UJSON_FORCEINLINE bool utf8_next_cp(const char* p, const char* e, const char*& out_p, std::uint32_t& out_cp) noexcept {
+        if (p >= e)
+            return false;
+
+        const auto b0 = static_cast<unsigned char>(*p++);
+
+        if (b0 < 0x80u) {
+            out_cp = b0;
+            out_p = p;
+            return true;
+        }
+
+        std::uint32_t cp;
+        if ((b0 >> 5) == 0x6) { // 2-byte
+            if (p >= e)
+                return false;
+            const auto b1 = static_cast<unsigned char>(*p++);
+            if (!is_cont(b1))
+                return false;
+            cp = (b0 & 0x1Fu) << 6 | (b1 & 0x3Fu);
+            if (cp < 0x80u)
+                return false;
+        } else if ((b0 >> 4) == 0xE) { // 3-byte
+            if (e - p < 2)
+                return false;
+            const auto b1 = static_cast<unsigned char>(*p++);
+            const auto b2 = static_cast<unsigned char>(*p++);
+            if (!is_cont(b1) || !is_cont(b2))
+                return false;
+            cp = (b0 & 0x0Fu) << 12 | (b1 & 0x3Fu) << 6 | (b2 & 0x3Fu);
+            if (cp < 0x800u)
+                return false;
+            if (cp >= 0xD800u && cp <= 0xDFFFu)
+                return false;
+        } else if ((b0 >> 3) == 0x1E) { // 4-byte
+            if (e - p < 3)
+                return false;
+            const auto b1 = static_cast<unsigned char>(*p++);
+            const auto b2 = static_cast<unsigned char>(*p++);
+            const auto b3 = static_cast<unsigned char>(*p++);
+            if (!is_cont(b1) || !is_cont(b2) || !is_cont(b3))
+                return false;
+            cp = (b0 & 0x07u) << 18 | (b1 & 0x3Fu) << 12 | (b2 & 0x3Fu) << 6 | (b3 & 0x3Fu);
+            if (cp < 0x10000u || cp > 0x10FFFFu)
+                return false;
+        } else {
+            return false;
+        }
+
+        out_cp = cp;
+        out_p = p;
+        return true;
+    }
+
+    UJSON_FORCEINLINE void append_hex4(char* dst, const std::uint16_t x) noexcept {
+        dst[0] = kHexDigits[(x >> 12) & 0xF];
+        dst[1] = kHexDigits[(x >> 8) & 0xF];
+        dst[2] = kHexDigits[(x >> 4) & 0xF];
+        dst[3] = kHexDigits[(x >> 0) & 0xF];
+    }
+
+    UJSON_FORCEINLINE char* append_u16_escape(char* dst, const std::uint16_t u) noexcept {
+        *dst++ = '\\';
+        *dst++ = 'u';
+        append_hex4(dst, u);
+        return dst + 4;
+    }
+    UJSON_FORCEINLINE char* append_ascii_escaped(char* dst, const unsigned char c) noexcept {
+        switch (c) {
+        case '\"':
+            *dst++ = '\\';
+            *dst++ = '\"';
+            return dst;
+        case '\\':
+            *dst++ = '\\';
+            *dst++ = '\\';
+            return dst;
+        case '\b':
+            *dst++ = '\\';
+            *dst++ = 'b';
+            return dst;
+        case '\f':
+            *dst++ = '\\';
+            *dst++ = 'f';
+            return dst;
+        case '\n':
+            *dst++ = '\\';
+            *dst++ = 'n';
+            return dst;
+        case '\r':
+            *dst++ = '\\';
+            *dst++ = 'r';
+            return dst;
+        case '\t':
+            *dst++ = '\\';
+            *dst++ = 't';
+            return dst;
+        default:
+            break;
+        }
+
+        if (c < 0x20u) {
+            return append_u16_escape(dst, c);
+        }
+
+        *dst++ = static_cast<char>(c);
+        return dst;
+    }
+
+    [[nodiscard]] UJSON_FORCEINLINE bool json_escape_utf8_to_ascii(const char* p, const char* e, char* out, std::size_t& out_len) noexcept {
+        char* dst = out;
+
+        while (p < e) {
+            if (const char* q = scan_ascii(p, e); q > p) {
+                const auto n = static_cast<std::size_t>(q - p);
+                std::memcpy(dst, p, n);
+                dst += n;
+                p = q;
+                if (p >= e)
+                    break;
+            }
+
+            if (const auto c = static_cast<unsigned char>(*p); c < 0x80u) {
+                ++p;
+                dst = append_ascii_escaped(dst, c);
+                continue;
+            }
+
+            std::uint32_t cp = 0;
+            const char* np = nullptr;
+            if (!utf8_next_cp(p, e, np, cp))
+                return false;
+            p = np;
+
+            if (cp <= 0xFFFFu) {
+                dst = append_u16_escape(dst, static_cast<std::uint16_t>(cp));
+            } else {
+                cp -= 0x10000u;
+                const auto hi = static_cast<std::uint16_t>(0xD800u + (cp >> 10));
+                const auto lo = static_cast<std::uint16_t>(0xDC00u + (cp & 0x3FFu));
+                dst = append_u16_escape(dst, hi);
+                dst = append_u16_escape(dst, lo);
+            }
+        }
+
+        out_len = static_cast<std::size_t>(dst - out);
+        return true;
+    }
+
+} // namespace ujson::detail
+
+namespace ujson::traits {
+    template <class CharT>
+    struct utf8_encoder;
+
+    template <>
+    struct utf8_encoder<char> {
+        static bool append(std::string& out, const std::string_view in) {
+            out.append(in.data(), in.size());
+            return true;
+        }
+    };
+
+#ifdef __cpp_char8_t
+    template <>
+    struct utf8_encoder<char8_t> {
+        UJSON_FORCEINLINE static bool append(std::string& out, const std::basic_string_view<char8_t> in) {
+            out.append(reinterpret_cast<const char*>(in.data()), in.size());
+            return true;
+        }
+    };
+#endif
+
+    template <>
+    struct utf8_encoder<char32_t> {
+        UJSON_FORCEINLINE static bool append(std::string& out, const std::basic_string_view<char32_t> in) {
+            out.reserve(out.size() + in.size() * 4);
+            for (const char32_t ch : in)
+                if (!detail::append_cp(out, ch))
+                    return false;
+            return true;
+        }
+    };
+
+    template <>
+    struct utf8_encoder<char16_t> {
+        UJSON_FORCEINLINE static bool append(std::string& out, const std::basic_string_view<char16_t> in) {
+            out.reserve(out.size() + in.size() * 4);
+
+            for (std::size_t i = 0; i < in.size(); ++i) {
+                const std::uint32_t w1 = in[i];
+
+                if (w1 >= 0xD800u && w1 <= 0xDBFFu) { // lead surrogate
+                    if (i + 1 >= in.size())
+                        return false;
+                    const std::uint32_t w2 = in[i + 1];
+                    if (w2 < 0xDC00u || w2 > 0xDFFFu)
+                        return false;
+
+                    const std::uint32_t cp = 0x10000u + (((w1 - 0xD800u) << 10) | (w2 - 0xDC00u));
+                    ++i;
+                    if (!detail::append_cp(out, cp))
+                        return false;
+                    continue;
+                }
+
+                if (w1 >= 0xDC00u && w1 <= 0xDFFFu) // stray trail surrogate
+                    return false;
+
+                if (!detail::append_cp(out, w1))
+                    return false;
+            }
+            return true;
+        }
+    };
+
+    template <>
+    struct utf8_encoder<wchar_t> {
+        UJSON_FORCEINLINE static bool append(std::string& out, const std::basic_string_view<wchar_t> in) {
+            if constexpr (sizeof(wchar_t) == 2) {
+                const auto v = std::basic_string_view {reinterpret_cast<const char16_t*>(in.data()), in.size()};
+                return utf8_encoder<char16_t>::append(out, v);
+            } else {
+                auto v = std::basic_string_view {reinterpret_cast<const char32_t*>(in.data()), in.size()};
+                return utf8_encoder<char32_t>::append(out, v);
+            }
+        }
+    };
+
+    template <class CharT>
+    struct utf8_encoded {
+        std::string storage;
+
+        [[nodiscard]] UJSON_FORCEINLINE std::string_view view() const noexcept {
+            return storage;
+        }
+    };
+
+    template <>
+    struct utf8_encoded<char> {
+        std::string_view storage;
+
+        [[nodiscard]] UJSON_FORCEINLINE std::string_view view() const noexcept {
+            return storage;
+        }
+    };
+
+#ifdef __cpp_char8_t
+    template <>
+    struct utf8_encoded<char8_t> {
+        std::string_view storage;
+
+        [[nodiscard]] UJSON_FORCEINLINE std::string_view view() const noexcept {
+            return storage;
+        }
+    };
+#endif
+
+    template <concepts::text_char CharT>
+    struct text_view {
+        using value_type = CharT;
+        using view_type = std::basic_string_view<CharT>;
+
+        constexpr text_view() noexcept = default;
+
+        constexpr explicit text_view(view_type v) noexcept: p_(v.data()), n_(v.size()) { }
+
+        constexpr explicit text_view(const CharT* s) noexcept: p_(s), n_(cstrlen(s)) { }
+
+        template <std::size_t N>
+        constexpr explicit text_view(const CharT (&s)[N]) noexcept: p_(s), n_(trim_nul(s, N)) { }
+
+        template <concepts::text_buffer Buf>
+            requires std::same_as<typename std::remove_cvref_t<Buf>::value_type, CharT>
+        constexpr explicit text_view(Buf&& b) noexcept: p_(static_cast<const CharT*>(std::as_const(b).data())), n_(static_cast<std::size_t>(std::as_const(b).size())) { }
+
+        [[nodiscard]] constexpr const CharT* data() const noexcept {
+            return p_;
+        }
+        [[nodiscard]] constexpr std::size_t size() const noexcept {
+            return n_;
+        }
+        [[nodiscard]] constexpr view_type view() const noexcept {
+            return view_type {p_, n_};
+        }
+
+    private:
+        static constexpr std::size_t cstrlen(const CharT* s) noexcept {
+            if (!s)
+                return 0;
+            std::size_t n = 0;
+            while (s[n] != CharT {})
+                ++n;
+            return n;
+        }
+
+        template <std::size_t N>
+        static constexpr std::size_t trim_nul(const CharT (&s)[N], std::size_t n) noexcept {
+            if (n && s[n - 1] == CharT {})
+                --n;
+            return n;
+        }
+
+        const CharT* p_ = nullptr;
+        std::size_t n_ = 0;
+    };
+
+    template <concepts::text_char CharT>
+    text_view(std::basic_string_view<CharT>) -> text_view<CharT>;
+
+    template <concepts::text_char CharT>
+    text_view(const CharT*) -> text_view<CharT>;
+
+    template <concepts::text_char CharT, std::size_t N>
+    text_view(const CharT (&)[N]) -> text_view<CharT>;
+
+    template <concepts::text_buffer Buf>
+    text_view(Buf&&) -> text_view<typename std::remove_cvref_t<Buf>::value_type>;
+
+} // namespace ujson::traits
+
+namespace ujson::detail {
+    template <class CharT>
+    UJSON_FORCEINLINE auto to_utf8(std::basic_string_view<CharT> in) {
+        if constexpr (std::same_as<CharT, char>) {
+            return traits::utf8_encoded<char> {std::string_view {in.data(), in.size()}};
+#ifdef __cpp_char8_t
+        } else if constexpr (std::same_as<CharT, char8_t>) {
+            return traits::utf8_encoded<char8_t> {std::string_view {reinterpret_cast<const char*>(in.data()), in.size()}};
+#endif
+        } else {
+            traits::utf8_encoded<CharT> r;
+            r.storage.reserve(in.size() * 4);
+            if (!traits::utf8_encoder<CharT>::append(r.storage, in))
+                r.storage.clear();
+            return r;
+        }
+    }
+
+    template <class T>
+    constexpr auto as_text(T&& v) {
+        using U = std::remove_cvref_t<T>;
+
+        if constexpr (concepts::text_array<U>) {
+            using C = std::remove_cv_t<std::remove_extent_t<U>>;
+            static_assert(concepts::text_char<C>);
+            return traits::text_view<C> {v};
+        } else if constexpr (concepts::text_buffer<U>) {
+            using C = typename U::value_type;
+            static_assert(concepts::text_char<C>);
+            return traits::text_view<C> {std::forward<T>(v)};
+        } else if constexpr (concepts::text_ptr<U>) {
+            using C = std::remove_cv_t<std::remove_pointer_t<U>>;
+            static_assert(concepts::text_char<C>);
+            return traits::text_view<C> {v};
+        } else {
+            static_assert(!sizeof(T), "as_text: unsupported type");
+        }
+    }
+} // namespace ujson::detail
+
+namespace ujson {
     struct TapeStorage;
     [[nodiscard]] UJSON_FORCEINLINE TapeStorage* tape_storage(const Arena* arena) noexcept;
 
@@ -1262,6 +1661,8 @@ namespace ujson {
     private:
         template <class Sink>
         friend class JsonWriterCore;
+        template <class Sink, detail::StringEscapePolicy Policy>
+        friend class detail::JsonWriterCoreImpl;
         friend class ValueRef;
         friend class SaxDomHandler;
         friend class ValueBuilder;
@@ -2285,7 +2686,7 @@ namespace ujson {
             if (!n_ || n_->type != Type::Array)
                 return {};
 
-            auto& k = n_->data.kids;
+            const auto& k = n_->data.kids;
             if (i >= k.count)
                 return {};
 
@@ -2591,6 +2992,8 @@ namespace ujson {
 
         template <class Sink>
         friend class JsonWriterCore;
+        template <class Sink, detail::StringEscapePolicy Policy>
+        friend class detail::JsonWriterCoreImpl;
 
         Node* n_ {};
         Arena* arena_ {};
@@ -2986,7 +3389,7 @@ namespace ujson {
                         return fail(ErrorCode::InvalidEscape, slash_pos);
 
                     const char* esc_pos = p;
-                    const unsigned char esc = static_cast<unsigned char>(*p++);
+                    const auto esc = static_cast<unsigned char>(*p++);
 
                     if (!detail::CharMask256::test(detail::kEscapeFollowMask, esc))
                         return fail(ErrorCode::InvalidEscape, esc_pos);
@@ -3957,365 +4360,424 @@ fallback_double:
     // fastest possible
     using DocumentFast = DocumentT<false, false, false>;
 
-    template <class Sink>
-    class JsonWriterCore {
-    public:
-        JsonWriterCore(Sink sink, const bool pretty, const std::size_t max_depth = 512, ParseError* err = nullptr): sink_(std::move(sink)), pretty_(pretty), max_depth_(max_depth), err_(err) {
-            if (err_)
-                *err_ = {};
-        }
-
-        [[nodiscard]] UJSON_FORCEINLINE bool write(const ValueRef v) {
-            tape_ = tape_storage(v.arena_);
-            if (tape_ready(tape_))
-                return write_tape_nonrec(v.raw());
-            return write_ptr_recursive(v.raw());
-        }
-
-        [[nodiscard]] UJSON_FORCEINLINE auto finish() {
-            return sink_.finish();
-        }
-
-    private:
-        UJSON_FORCEINLINE void set_err(const ErrorCode c) const {
-            if (err_ && err_->ok())
-                err_->set(c, nullptr);
-        }
-
-        [[nodiscard]] UJSON_FORCEINLINE bool fail_overflow() const noexcept {
-            set_err(ErrorCode::WriterOverflow);
-            return false;
-        }
-
-        [[nodiscard]] UJSON_FORCEINLINE bool put(char c) {
-            if (!sink_.put(c))
-                return fail_overflow();
-            return true;
-        }
-
-        [[nodiscard]] UJSON_FORCEINLINE bool puts(std::string_view s) {
-            if (!sink_.puts(s))
-                return fail_overflow();
-            return true;
-        }
-
-        [[nodiscard]] UJSON_FORCEINLINE bool newline() {
-            if (!pretty_)
-                return true;
-
-            if (!put('\n'))
-                return false;
-
-            for (auto i = 0; i < indent_; ++i) {
-                if (!put(' '))
-                    return false;
-            }
-            return true;
-        }
-
-        [[nodiscard]] bool write_string(const std::string_view s) {
-            if (!put('"'))
-                return false;
-
-            const char* p = s.data();
-            const char* e = p + s.size();
-
-            while (p < e) {
-                if (const char* q = detail::find_escape_in_string(p, e); q > p) {
-                    if (!puts(std::string_view {p, static_cast<std::size_t>(q - p)}))
-                        return false;
-                    p = q;
-                    if (p >= e)
-                        break;
-                }
-
-                const auto c = static_cast<unsigned char>(*p++);
-
-                if (!detail::CharMask256::test(detail::kEscapeMask, c)) {
-                    if (!put(static_cast<char>(c)))
-                        return false;
-                    continue;
-                }
-
-                switch (c) {
-                case '"': // NOLINT(bugprone-branch-clone)
-                    if (!puts("\\\""))
-                        return false;
-                    break;
-                case '\\':
-                    if (!puts("\\\\"))
-                        return false;
-                    break;
-                case '\b':
-                    if (!puts("\\b"))
-                        return false;
-                    break;
-                case '\f':
-                    if (!puts("\\f"))
-                        return false;
-                    break;
-                case '\n':
-                    if (!puts("\\n"))
-                        return false;
-                    break;
-                case '\r':
-                    if (!puts("\\r"))
-                        return false;
-                    break;
-                case '\t':
-                    if (!puts("\\t"))
-                        return false;
-                    break;
-                default: {
-                    char tmp[6];
-                    tmp[0] = '\\';
-                    tmp[1] = 'u';
-                    tmp[2] = '0';
-                    tmp[3] = '0';
-                    tmp[4] = detail::kHexDigits[(c >> 4) & 0xF];
-                    tmp[5] = detail::kHexDigits[c & 0xF];
-                    if (!puts(std::string_view {tmp, 6}))
-                        return false;
-                    break;
-                }
-                }
-            }
-
-            return put('"');
-        }
-
-        [[nodiscard]] bool write_i64(const std::int64_t v) {
-            char tmp[32];
-            auto [p, ec] = std::to_chars(tmp, tmp + sizeof(tmp), v);
-            if (ec != std::errc {}) {
-                set_err(ErrorCode::ToCharsFailed);
-                return false;
-            }
-            return puts(std::string_view {tmp, static_cast<std::size_t>(p - tmp)});
-        }
-
-        [[nodiscard]] bool write_double(const double d) {
-            if (!std::isfinite(d)) {
-                set_err(ErrorCode::ToCharsFailed);
-                return false;
-            }
-            char tmp[32];
-            auto [p, ec] = std::to_chars(tmp, tmp + sizeof(tmp), d);
-            if (ec != std::errc {}) {
-                set_err(ErrorCode::ToCharsFailed);
-                return false;
-            }
-            return puts(std::string_view {tmp, static_cast<std::size_t>(p - tmp)});
-        }
-
-        [[nodiscard]] UJSON_FORCEINLINE bool write_number(const Number& n) {
-            return (n.kind == NumberKind::Integer) ? write_i64(n.i) : write_double(n.d);
-        }
-
-        [[nodiscard]] UJSON_FORCEINLINE bool write_primitive(const Node* n) {
-            switch (n ? n->type : Type::Null) {
-            case Type::Null:
-                return puts("null");
-            case Type::Bool:
-                return puts(n->data.b ? "true" : "false");
-            case Type::Number:
-                return write_number(n->data.num);
-            case Type::String:
-                return write_string(n->data.str);
-            case Type::Array:
-            case Type::Object:
-                break;
-            }
-            return true;
-        }
-
-        struct Frame {
-            Type type {};
-            std::uint32_t cur_idx {};
-            std::uint32_t remaining {};
-            std::uint32_t count {};
-            bool emitted_any {};
+    namespace detail {
+        enum class StringEscapePolicy : std::uint8_t {
+            Escape,
+            PreEscaped
         };
 
-        [[nodiscard]] bool open_container(const Node* n) {
-            if (depth_ + 1 > max_depth_) {
-                set_err(ErrorCode::EncodeDepthExceeded);
-                return false;
-            }
-            ++depth_;
-            indent_ += 2;
+#ifndef UJSON_PRETTY_INDENT
+        inline constexpr int kPrettyIndent = 2;
+#else
+        inline constexpr int kPrettyIndent = UJSON_PRETTY_INDENT;
+#endif
+        static_assert(kPrettyIndent > 0, "UJSON_PRETTY_INDENT must be positive");
 
-            if (n->type == Type::Array)
-                return put('[');
-            return put('{');
-        }
-
-        [[nodiscard]] bool close_container(const Type t, const std::uint32_t count) {
-            indent_ -= 2;
-            --depth_;
-
-            if (pretty_ && count)
-                if (!newline())
-                    return false;
-
-            return put(t == Type::Array ? ']' : '}');
-        }
-
-        [[nodiscard]] bool write_tape_nonrec(const Node* root) {
-            if (!root)
-                return puts("null");
-
-            if (!Node::is_container(root->type))
-                return write_primitive(root);
-
-            const std::uint32_t root_idx = tape_index_of(tape_, root);
-
-            if (depth_ + 1 > max_depth_) {
-                set_err(ErrorCode::EncodeDepthExceeded);
-                return false;
+        template <class Sink, StringEscapePolicy Policy>
+        class JsonWriterCoreImpl {
+        public:
+            JsonWriterCoreImpl(Sink sink, const bool pretty, const std::size_t max_depth = 512, ParseError* err = nullptr): sink_(std::move(sink)), pretty_(pretty), max_depth_(max_depth), err_(err) {
+                if (err_)
+                    *err_ = {};
             }
 
-            constexpr std::size_t kInlineDepth = 64;
+            [[nodiscard]] UJSON_FORCEINLINE bool write(const ValueRef v) {
+                tape_ = tape_storage(v.arena_);
+                if (tape_ready(tape_))
+                    return write_tape_nonrec(v.raw());
+                return write_ptr_recursive(v.raw());
+            }
 
-            Frame inline_stack[kInlineDepth];
-            Frame* stack = inline_stack;
-            std::size_t capacity = kInlineDepth;
-            std::size_t sp = 0;
+            [[nodiscard]] UJSON_FORCEINLINE auto finish() {
+                return sink_.finish();
+            }
 
-            std::unique_ptr<Frame[]> heap_stack;
+        private:
+            UJSON_FORCEINLINE void set_err(const ErrorCode c) const {
+                if (err_ && err_->ok())
+                    err_->set(c, nullptr);
+            }
 
-            auto ensure_capacity = [&](const std::size_t need) -> bool {
-                if (need <= capacity)
+            [[nodiscard]] UJSON_FORCEINLINE bool fail_overflow() const noexcept {
+                set_err(ErrorCode::WriterOverflow);
+                return false;
+            }
+
+            [[nodiscard]] UJSON_FORCEINLINE bool put(char c) {
+                if (!sink_.put(c))
+                    return fail_overflow();
+                return true;
+            }
+
+            [[nodiscard]] UJSON_FORCEINLINE bool puts(std::string_view s) {
+                if (!sink_.puts(s))
+                    return fail_overflow();
+                return true;
+            }
+
+            [[nodiscard]] UJSON_FORCEINLINE bool newline() {
+                if (!pretty_)
                     return true;
 
-                if (need > max_depth_) {
+                if (!put('\n'))
+                    return false;
+
+                for (auto i = 0; i < indent_; ++i) {
+                    if (!put(' '))
+                        return false;
+                }
+                return true;
+            }
+
+            [[nodiscard]] bool write_string(const std::string_view s) {
+                if constexpr (Policy == StringEscapePolicy::PreEscaped) {
+                    if (!put('"'))
+                        return false;
+                    if (!s.empty() && !puts(s))
+                        return false;
+                    return put('"');
+                } else {
+                    if (!put('"'))
+                        return false;
+
+                    const char* p = s.data();
+                    const char* e = p + s.size();
+
+                    while (p < e) {
+                        if (const char* q = detail::find_escape_in_string(p, e); q > p) {
+                            if (!puts(std::string_view {p, static_cast<std::size_t>(q - p)}))
+                                return false;
+                            p = q;
+                            if (p >= e)
+                                break;
+                        }
+
+                        const auto c = static_cast<unsigned char>(*p++);
+
+                        if (!detail::CharMask256::test(detail::kEscapeMask, c)) {
+                            if (!put(static_cast<char>(c)))
+                                return false;
+                            continue;
+                        }
+
+                        switch (c) {
+                        case '"': // NOLINT(bugprone-branch-clone)
+                            if (!puts("\\\""))
+                                return false;
+                            break;
+                        case '\\':
+                            if (!puts("\\\\"))
+                                return false;
+                            break;
+                        case '\b':
+                            if (!puts("\\b"))
+                                return false;
+                            break;
+                        case '\f':
+                            if (!puts("\\f"))
+                                return false;
+                            break;
+                        case '\n':
+                            if (!puts("\\n"))
+                                return false;
+                            break;
+                        case '\r':
+                            if (!puts("\\r"))
+                                return false;
+                            break;
+                        case '\t':
+                            if (!puts("\\t"))
+                                return false;
+                            break;
+                        default: {
+                            char tmp[6];
+                            tmp[0] = '\\';
+                            tmp[1] = 'u';
+                            tmp[2] = '0';
+                            tmp[3] = '0';
+                            tmp[4] = detail::kHexDigits[(c >> 4) & 0xF];
+                            tmp[5] = detail::kHexDigits[c & 0xF];
+                            if (!puts(std::string_view {tmp, 6}))
+                                return false;
+                            break;
+                        }
+                        }
+                    }
+
+                    return put('"');
+                }
+            }
+
+            [[nodiscard]] bool write_i64(const std::int64_t v) {
+                char tmp[32];
+                auto [p, ec] = std::to_chars(tmp, tmp + sizeof(tmp), v);
+                if (ec != std::errc {}) {
+                    set_err(ErrorCode::ToCharsFailed);
+                    return false;
+                }
+                return puts(std::string_view {tmp, static_cast<std::size_t>(p - tmp)});
+            }
+
+            [[nodiscard]] bool write_double(const double d) {
+                if (!std::isfinite(d)) {
+                    set_err(ErrorCode::ToCharsFailed);
+                    return false;
+                }
+                char tmp[32];
+                auto [p, ec] = std::to_chars(tmp, tmp + sizeof(tmp), d);
+                if (ec != std::errc {}) {
+                    set_err(ErrorCode::ToCharsFailed);
+                    return false;
+                }
+                return puts(std::string_view {tmp, static_cast<std::size_t>(p - tmp)});
+            }
+
+            [[nodiscard]] UJSON_FORCEINLINE bool write_number(const Number& n) {
+                return (n.kind == NumberKind::Integer) ? write_i64(n.i) : write_double(n.d);
+            }
+
+            [[nodiscard]] UJSON_FORCEINLINE bool write_primitive(const Node* n) {
+                switch (n ? n->type : Type::Null) {
+                case Type::Null:
+                    return puts("null");
+                case Type::Bool:
+                    return puts(n->data.b ? "true" : "false");
+                case Type::Number:
+                    return write_number(n->data.num);
+                case Type::String:
+                    return write_string(n->data.str);
+                case Type::Array:
+                case Type::Object:
+                    break;
+                }
+                return true;
+            }
+
+            struct Frame {
+                Type type {};
+                std::uint32_t cur_idx {};
+                std::uint32_t remaining {};
+                std::uint32_t count {};
+                bool emitted_any {};
+            };
+
+            [[nodiscard]] bool open_container(const Node* n) {
+                if (depth_ + 1 > max_depth_) {
+                    set_err(ErrorCode::EncodeDepthExceeded);
+                    return false;
+                }
+                ++depth_;
+                indent_ += kPrettyIndent;
+
+                if (n->type == Type::Array)
+                    return put('[');
+                return put('{');
+            }
+
+            [[nodiscard]] bool close_container(const Type t, const std::uint32_t count) {
+                indent_ -= kPrettyIndent;
+                --depth_;
+
+                if (pretty_ && count)
+                    if (!newline())
+                        return false;
+
+                return put(t == Type::Array ? ']' : '}');
+            }
+
+            [[nodiscard]] bool write_tape_nonrec(const Node* root) {
+                if (!root)
+                    return puts("null");
+
+                if (!Node::is_container(root->type))
+                    return write_primitive(root);
+
+                const std::uint32_t root_idx = tape_index_of(tape_, root);
+
+                if (depth_ + 1 > max_depth_) {
                     set_err(ErrorCode::EncodeDepthExceeded);
                     return false;
                 }
 
-                std::size_t new_cap = capacity * 2;
-                while (new_cap < need)
-                    new_cap *= 2;
+                constexpr std::size_t kInlineDepth = 64;
 
-                new_cap = std::min(new_cap, max_depth_);
+                Frame inline_stack[kInlineDepth];
+                Frame* stack = inline_stack;
+                std::size_t capacity = kInlineDepth;
+                std::size_t sp = 0;
 
-                heap_stack.reset(new (std::nothrow) Frame[new_cap]);
-                if (!heap_stack)
-                    return fail_overflow();
+                std::unique_ptr<Frame[]> heap_stack;
 
-                std::memcpy(heap_stack.get(), stack, sp * sizeof(Frame));
+                auto ensure_capacity = [&](const std::size_t need) -> bool {
+                    if (need <= capacity)
+                        return true;
 
-                stack = heap_stack.get();
-                capacity = new_cap;
-                return true;
-            };
-
-            if (!open_container(root))
-                return false;
-
-            stack[sp++] = Frame {
-                .type = root->type,
-                .cur_idx = root_idx + 1u,
-                .remaining = root->data.kids.count,
-                .count = root->data.kids.count,
-                .emitted_any = false,
-            };
-
-            while (sp) {
-                Frame& f = stack[sp - 1];
-
-                if (f.remaining == 0) {
-                    const Type t = f.type;
-                    const std::uint32_t cnt = f.count;
-
-                    --sp;
-
-                    if (!close_container(t, cnt))
+                    if (need > max_depth_) {
+                        set_err(ErrorCode::EncodeDepthExceeded);
                         return false;
+                    }
 
-                    continue;
-                }
+                    std::size_t new_cap = capacity * 2;
+                    while (new_cap < need)
+                        new_cap *= 2;
 
-                if (f.emitted_any) {
-                    if (!put(','))
-                        return false;
-                }
+                    new_cap = std::min(new_cap, max_depth_);
 
-                if (!newline())
+                    heap_stack.reset(new (std::nothrow) Frame[new_cap]);
+                    if (!heap_stack)
+                        return fail_overflow();
+
+                    std::memcpy(heap_stack.get(), stack, sp * sizeof(Frame));
+
+                    stack = heap_stack.get();
+                    capacity = new_cap;
+                    return true;
+                };
+
+                if (!open_container(root))
                     return false;
 
-                if (f.cur_idx >= tape_->size)
-                    return fail_overflow();
+                stack[sp++] = Frame {
+                    .type = root->type,
+                    .cur_idx = root_idx + 1u,
+                    .remaining = root->data.kids.count,
+                    .count = root->data.kids.count,
+                    .emitted_any = false,
+                };
 
-                const Node* child = tape_->tape + f.cur_idx;
+                while (sp) {
+                    Frame& f = stack[sp - 1];
 
-                if (f.type == Type::Object) {
-                    if (!write_string(child->key))
+                    if (f.remaining == 0) {
+                        const Type t = f.type;
+                        const std::uint32_t cnt = f.count;
+
+                        --sp;
+
+                        if (!close_container(t, cnt))
+                            return false;
+
+                        continue;
+                    }
+
+                    if (f.emitted_any) {
+                        if (!put(','))
+                            return false;
+                    }
+
+                    if (!newline())
                         return false;
 
-                    if (!put(':'))
-                        return false;
+                    if (f.cur_idx >= tape_->size)
+                        return fail_overflow();
 
-                    if (pretty_ && !put(' '))
-                        return false;
-                }
+                    const Node* child = tape_->tape + f.cur_idx;
 
-                if (!Node::is_container(child->type)) {
-                    if (!write_primitive(child))
-                        return false;
+                    if (f.type == Type::Object) {
+                        if (!write_string(child->key))
+                            return false;
+
+                        if (!put(':'))
+                            return false;
+
+                        if (pretty_ && !put(' '))
+                            return false;
+                    }
+
+                    if (!Node::is_container(child->type)) {
+                        if (!write_primitive(child))
+                            return false;
+
+                        f.cur_idx = subtree_next_index(tape_, f.cur_idx);
+                        --f.remaining;
+                        f.emitted_any = true;
+                        continue;
+                    }
+
+                    const std::uint32_t child_idx = f.cur_idx;
 
                     f.cur_idx = subtree_next_index(tape_, f.cur_idx);
                     --f.remaining;
                     f.emitted_any = true;
-                    continue;
+
+                    if (!ensure_capacity(sp + 1))
+                        return false;
+
+                    if (!open_container(child))
+                        return false;
+
+                    stack[sp++] = Frame {
+                        .type = child->type,
+                        .cur_idx = child_idx + 1u,
+                        .remaining = child->data.kids.count,
+                        .count = child->data.kids.count,
+                        .emitted_any = false,
+                    };
                 }
 
-                const std::uint32_t child_idx = f.cur_idx;
+                return true;
+            }
 
-                f.cur_idx = subtree_next_index(tape_, f.cur_idx);
-                --f.remaining;
-                f.emitted_any = true;
+            [[nodiscard]] bool write_ptr_recursive(const Node* n) {
+                if (!n)
+                    return puts("null");
 
-                if (!ensure_capacity(sp + 1))
+                if (!Node::is_container(n->type))
+                    return write_primitive(n);
+
+                if (depth_ + 1 > max_depth_) {
+                    set_err(ErrorCode::EncodeDepthExceeded);
                     return false;
+                }
 
-                if (!open_container(child))
-                    return false;
+                ++depth_;
+                indent_ += kPrettyIndent;
 
-                stack[sp++] = Frame {
-                    .type = child->type,
-                    .cur_idx = child_idx + 1u,
-                    .remaining = child->data.kids.count,
-                    .count = child->data.kids.count,
-                    .emitted_any = false,
+                auto epilog = [this]() noexcept {
+                    indent_ -= kPrettyIndent;
+                    --depth_;
                 };
-            }
 
-            return true;
-        }
+                if (n->type == Type::Array) {
+                    if (!put('[')) {
+                        epilog();
+                        return false;
+                    }
 
-        [[nodiscard]] bool write_ptr_recursive(const Node* n) {
-            if (!n)
-                return puts("null");
+                    const auto& k = n->data.kids;
+                    if (!k.items && k.count) {
+                        epilog();
+                        return fail_overflow();
+                    }
 
-            if (!Node::is_container(n->type))
-                return write_primitive(n);
+                    for (std::uint32_t i = 0; i < k.count; ++i) {
+                        if (i && !put(',')) {
+                            epilog();
+                            return false;
+                        }
+                        if (!newline()) {
+                            epilog();
+                            return false;
+                        }
+                        if (!write_ptr_recursive(k.items[i])) {
+                            epilog();
+                            return false;
+                        }
+                    }
 
-            if (depth_ + 1 > max_depth_) {
-                set_err(ErrorCode::EncodeDepthExceeded);
-                return false;
-            }
+                    if (k.count && !newline()) {
+                        epilog();
+                        return false;
+                    }
+                    if (!put(']')) {
+                        epilog();
+                        return false;
+                    }
+                    epilog();
+                    return true;
+                }
 
-            ++depth_;
-            indent_ += 2;
-
-            auto epilog = [this]() noexcept {
-                indent_ -= 2;
-                --depth_;
-            };
-
-            if (n->type == Type::Array) {
-                if (!put('[')) {
+                if (!put('{')) {
                     epilog();
                     return false;
                 }
@@ -4335,7 +4797,27 @@ fallback_double:
                         epilog();
                         return false;
                     }
-                    if (!write_ptr_recursive(k.items[i])) {
+
+                    const Node* child = k.items[i];
+                    if (!child) {
+                        epilog();
+                        return fail_overflow();
+                    }
+
+                    if (!write_string(child->key)) {
+                        epilog();
+                        return false;
+                    }
+                    if (!put(':')) {
+                        epilog();
+                        return false;
+                    }
+                    if (pretty_ && !put(' ')) {
+                        epilog();
+                        return false;
+                    }
+
+                    if (!write_ptr_recursive(child)) {
                         epilog();
                         return false;
                     }
@@ -4345,7 +4827,7 @@ fallback_double:
                     epilog();
                     return false;
                 }
-                if (!put(']')) {
+                if (!put('}')) {
                     epilog();
                     return false;
                 }
@@ -4353,73 +4835,33 @@ fallback_double:
                 return true;
             }
 
-            if (!put('{')) {
-                epilog();
-                return false;
-            }
+            Sink sink_;
+            bool pretty_ {};
+            int indent_ {};
 
-            const auto& k = n->data.kids;
-            if (!k.items && k.count) {
-                epilog();
-                return fail_overflow();
-            }
+            std::size_t max_depth_ {};
+            std::size_t depth_ {};
 
-            for (std::uint32_t i = 0; i < k.count; ++i) {
-                if (i && !put(',')) {
-                    epilog();
-                    return false;
-                }
-                if (!newline()) {
-                    epilog();
-                    return false;
-                }
+            TapeStorage* tape_ {};
+            ParseError* err_ {};
+        };
+    } // namespace detail
 
-                const Node* child = k.items[i];
-                if (!child) {
-                    epilog();
-                    return fail_overflow();
-                }
+    template <class Sink>
+    class JsonWriterCore {
+    public:
+        JsonWriterCore(Sink sink, const bool pretty, const std::size_t max_depth = 512, ParseError* err = nullptr): impl_(std::move(sink), pretty, max_depth, err) { }
 
-                if (!write_string(child->key)) {
-                    epilog();
-                    return false;
-                }
-                if (!put(':')) {
-                    epilog();
-                    return false;
-                }
-                if (pretty_ && !put(' ')) {
-                    epilog();
-                    return false;
-                }
-
-                if (!write_ptr_recursive(child)) {
-                    epilog();
-                    return false;
-                }
-            }
-
-            if (k.count && !newline()) {
-                epilog();
-                return false;
-            }
-            if (!put('}')) {
-                epilog();
-                return false;
-            }
-            epilog();
-            return true;
+        [[nodiscard]] UJSON_FORCEINLINE bool write(const ValueRef v) {
+            return impl_.write(v);
         }
 
-        Sink sink_;
-        bool pretty_ {};
-        int indent_ {};
+        [[nodiscard]] UJSON_FORCEINLINE auto finish() {
+            return impl_.finish();
+        }
 
-        std::size_t max_depth_ {};
-        std::size_t depth_ {};
-
-        TapeStorage* tape_ {};
-        ParseError* err_ {};
+    private:
+        detail::JsonWriterCoreImpl<Sink, detail::StringEscapePolicy::Escape> impl_;
     };
 
     struct FixedBufferSink {
@@ -4820,6 +5262,7 @@ fallback_double:
             Node* n = make_value_node(Type::String);
             if (!n)
                 return;
+
             n->data.str = s;
             attach(n);
         }
@@ -5042,6 +5485,11 @@ namespace ujson {
         Copy
     };
 
+    enum class EncodingPolicy : std::uint8_t {
+        Utf8, // UTF-8 output (non-ASCII allowed)
+        JsonEscaped, // \uXXXX for non-ASCII (ASCII-only output)
+    };
+
     class NodeRef {
     public:
         NodeRef() = default;
@@ -5125,6 +5573,7 @@ namespace ujson {
     public:
         struct Options {
             StringPolicy strings = StringPolicy::Copy;
+            EncodingPolicy encoding = EncodingPolicy::Utf8;
             std::uint32_t max_depth = 512;
             float max_load = 0.70f;
         };
@@ -5165,7 +5614,18 @@ namespace ujson {
         [[nodiscard]] std::string encode(const bool pretty = false) const {
             if (!root_ || !ok())
                 return {};
-            return ujson::encode(ValueRef {root_, arena_}, pretty);
+
+            if (opt_.encoding == EncodingPolicy::JsonEscaped) {
+                detail::JsonWriterCoreImpl<StringSink, detail::StringEscapePolicy::PreEscaped> writer(StringSink {}, pretty, kDefaultMaxDepth, nullptr);
+                if (!writer.write(ValueRef {root_, arena_}))
+                    return {};
+                return writer.finish();
+            }
+
+            detail::JsonWriterCoreImpl<StringSink, detail::StringEscapePolicy::Escape> writer(StringSink {}, pretty, kDefaultMaxDepth, nullptr);
+            if (!writer.write(ValueRef {root_, arena_}))
+                return {};
+            return writer.finish();
         }
 
     private:
@@ -5600,18 +6060,24 @@ namespace ujson {
         [[nodiscard]] UJSON_FORCEINLINE Node* make_from_value(T&& v) { // NOLINT(cppcoreguidelines-missing-std-forward)
             using U = std::decay_t<std::remove_cvref_t<T>>;
 
-            if constexpr (std::is_same_v<U, std::nullptr_t>) {
+            if constexpr (std::is_same_v<U, Node*>) {
+                return v;
+
+            } else if constexpr (std::is_same_v<U, std::nullptr_t>) {
                 return make_value_node(Type::Null);
+
             } else if constexpr (std::is_same_v<U, bool>) {
                 Node* n = make_value_node(Type::Bool);
                 if (!n)
                     return nullptr;
                 n->data.b = v;
                 return n;
+
             } else if constexpr (std::is_integral_v<U> && !std::is_same_v<U, bool>) {
                 Node* n = make_value_node(Type::Number);
                 if (!n)
                     return nullptr;
+
                 if constexpr (std::is_signed_v<U>) {
                     n->data.num = Number::from_i64(static_cast<std::int64_t>(v));
                 } else {
@@ -5621,33 +6087,30 @@ namespace ujson {
                         n->data.num = Number::from_double(static_cast<double>(v));
                 }
                 return n;
+
             } else if constexpr (std::is_floating_point_v<U>) {
                 Node* n = make_value_node(Type::Number);
                 if (!n)
                     return nullptr;
                 n->data.num = Number::from_double(static_cast<double>(v));
                 return n;
-            } else if constexpr (std::is_same_v<U, std::string_view>) {
+
+            } else if constexpr (concepts::string_like<U>) {
                 Node* n = make_value_node(Type::String);
                 if (!n)
                     return nullptr;
-                n->data.str = materialize(v);
+
+                // null pointer special-case: const char* / wchar_t* / etc.
+                if constexpr (std::is_pointer_v<U>) {
+                    if (!v) {
+                        n->data.str = materialize_text(std::string_view {}); // empty
+                        return n;
+                    }
+                }
+
+                n->data.str = materialize_any_string(std::forward<T>(v));
                 return n;
-            } else if constexpr (std::is_same_v<U, std::string>) {
-                Node* n = make_value_node(Type::String);
-                if (!n)
-                    return nullptr;
-                n->data.str = materialize(v);
-                return n;
-            } else if constexpr (std::is_same_v<U, const char*> || std::is_same_v<U, char*>) {
-                Node* n = make_value_node(Type::String);
-                if (!n)
-                    return nullptr;
-                const char* s = v ? v : "";
-                n->data.str = materialize(std::string_view {s});
-                return n;
-            } else if constexpr (std::is_same_v<U, Node*>) {
-                return v;
+
             } else {
                 static_assert(!sizeof(U), "Unsupported value type for ValueBuilder");
                 return nullptr;
@@ -5773,6 +6236,240 @@ namespace ujson {
         }
 
     private:
+        template <class S>
+        [[nodiscard]] UJSON_FORCEINLINE std::string_view materialize_any_string(S&& s) {
+            auto tv = detail::as_text(std::forward<S>(s)); // traits::text_view<CharT>
+            auto v = tv.view(); // basic_string_view<CharT>
+            return materialize_text(v); // Utf8 or JsonEscaped (arena/view)
+        }
+
+        template <class CharT>
+        [[nodiscard]] UJSON_FORCEINLINE std::string_view materialize_utf8_bytes(std::basic_string_view<CharT> in) {
+            // Utf8 output bytes, stored in arena if needed
+            if constexpr (std::same_as<CharT, char>) {
+                const std::string_view sv {in.data(), in.size()};
+                if (opt_.strings == StringPolicy::View)
+                    return sv;
+
+                auto p = static_cast<char*>(arena().alloc(sv.size() + 1, 1));
+                if (!p) {
+                    set_err(ErrorCode::WriterOverflow);
+                    return {};
+                }
+                std::memcpy(p, sv.data(), sv.size());
+                p[sv.size()] = '\0';
+                return {p, sv.size()};
+#ifdef __cpp_char8_t
+            } else if constexpr (std::same_as<CharT, char8_t>) {
+                const std::string_view sv {reinterpret_cast<const char*>(in.data()), in.size()};
+                if (opt_.strings == StringPolicy::View)
+                    return sv;
+
+                auto p = static_cast<char*>(arena().alloc(sv.size() + 1, 1));
+                if (!p) {
+                    set_err(ErrorCode::WriterOverflow);
+                    return {};
+                }
+                std::memcpy(p, sv.data(), sv.size());
+                p[sv.size()] = '\0';
+                return {p, sv.size()};
+#endif
+            } else {
+                // wide -> utf8 in arena
+                // worst-case 4 bytes per code unit (safe upper bound)
+                const std::size_t cap = in.size() * 4 + 1;
+                auto p = static_cast<char*>(arena().alloc(cap, 1));
+                if (!p) {
+                    set_err(ErrorCode::WriterOverflow);
+                    return {};
+                }
+
+                char* dst = p;
+                auto ok = true;
+
+                if constexpr (std::same_as<CharT, char32_t>) {
+                    for (const char32_t ch : in) {
+                        const auto cp = static_cast<std::uint32_t>(ch);
+                        const std::size_t n = ujson::detail::utf8_encode(dst, cp);
+                        if (!n) {
+                            ok = false;
+                            break;
+                        }
+                        dst += n;
+                    }
+                } else if constexpr (std::same_as<CharT, char16_t>) {
+                    for (std::size_t i = 0; i < in.size(); ++i) {
+                        const std::uint32_t w1 = in[i];
+                        std::uint32_t cp;
+
+                        if (w1 >= 0xD800u && w1 <= 0xDBFFu) {
+                            if (i + 1 >= in.size()) {
+                                ok = false;
+                                break;
+                            }
+                            const std::uint32_t w2 = in[i + 1];
+                            if (w2 < 0xDC00u || w2 > 0xDFFFu) {
+                                ok = false;
+                                break;
+                            }
+                            cp = 0x10000u + (((w1 - 0xD800u) << 10) | (w2 - 0xDC00u));
+                            ++i;
+                        } else if (w1 >= 0xDC00u && w1 <= 0xDFFFu) {
+                            ok = false;
+                            break;
+                        } else {
+                            cp = w1;
+                        }
+
+                        const std::size_t n = ujson::detail::utf8_encode(dst, cp);
+                        if (!n) {
+                            ok = false;
+                            break;
+                        }
+                        dst += n;
+                    }
+                } else if constexpr (std::same_as<CharT, wchar_t>) {
+                    if constexpr (sizeof(wchar_t) == 2) {
+                        return materialize_utf8_bytes(std::basic_string_view<char16_t> {reinterpret_cast<const char16_t*>(in.data()), in.size()});
+                    } else {
+                        return materialize_utf8_bytes(std::basic_string_view<char32_t> {reinterpret_cast<const char32_t*>(in.data()), in.size()});
+                    }
+                } else {
+                    static_assert(!sizeof(CharT), "unsupported CharT");
+                }
+
+                if (!ok) {
+                    set_err(ErrorCode::InvalidUnicode);
+                    return {};
+                }
+                const auto out_len = static_cast<std::size_t>(dst - p);
+                p[out_len] = '\0';
+                return {p, out_len};
+            }
+        }
+
+        template <class CharT>
+        [[nodiscard]] UJSON_FORCEINLINE std::string_view materialize_json_escaped(std::basic_string_view<CharT> in) {
+            // Produce ASCII-only JSON-escaped bytes in arena
+            // worst-case: every code unit -> surrogate pair => 12 bytes, safe cap = in.size()*12 + 1
+            const std::size_t cap = in.size() * 12 + 1;
+            auto p = static_cast<char*>(arena().alloc(cap, 1));
+            if (!p) {
+                set_err(ErrorCode::WriterOverflow);
+                return {};
+            }
+
+            std::size_t out_len = 0;
+
+            if constexpr (std::same_as<CharT, char>) {
+                if (!ujson::detail::json_escape_utf8_to_ascii(in.data(), in.data() + in.size(), p, out_len)) {
+                    set_err(ErrorCode::InvalidUnicode);
+                    return {};
+                }
+#ifdef __cpp_char8_t
+            } else if constexpr (std::same_as<CharT, char8_t>) {
+                auto b = reinterpret_cast<const char*>(in.data());
+                if (!ujson::detail::json_escape_utf8_to_ascii(b, b + in.size(), p, out_len)) {
+                    set_err(ErrorCode::InvalidUnicode);
+                    return {};
+                }
+#endif
+            } else {
+                // wide: write escapes directly (no intermediate utf8)
+                char* dst = p;
+
+                auto emit_cp = [&](std::uint32_t cp) {
+                    if (cp < 0x80u) {
+                        dst = ujson::detail::append_ascii_escaped(dst, static_cast<unsigned char>(cp));
+                        return true;
+                    }
+                    if (cp <= 0xFFFFu) {
+                        dst = ujson::detail::append_u16_escape(dst, static_cast<std::uint16_t>(cp));
+                        return true;
+                    }
+                    cp -= 0x10000u;
+                    const auto hi = static_cast<std::uint16_t>(0xD800u + (cp >> 10));
+                    const auto lo = static_cast<std::uint16_t>(0xDC00u + (cp & 0x3FFu));
+                    dst = ujson::detail::append_u16_escape(dst, hi);
+                    dst = ujson::detail::append_u16_escape(dst, lo);
+                    return true;
+                };
+
+                auto ok = true;
+
+                if constexpr (std::same_as<CharT, char32_t>) {
+                    for (const char32_t ch : in) {
+                        const auto cp = static_cast<std::uint32_t>(ch);
+                        if (cp >= 0xD800u && cp <= 0xDFFFu) {
+                            ok = false;
+                            break;
+                        }
+                        if (cp > 0x10FFFFu) {
+                            ok = false;
+                            break;
+                        }
+                        if (!emit_cp(cp)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                } else if constexpr (std::same_as<CharT, char16_t>) {
+                    for (std::size_t i = 0; i < in.size(); ++i) {
+                        const std::uint32_t w1 = in[i];
+                        std::uint32_t cp = 0;
+
+                        if (w1 >= 0xD800u && w1 <= 0xDBFFu) {
+                            if (i + 1 >= in.size()) {
+                                ok = false;
+                                break;
+                            }
+                            const std::uint32_t w2 = in[i + 1];
+                            if (w2 < 0xDC00u || w2 > 0xDFFFu) {
+                                ok = false;
+                                break;
+                            }
+                            cp = 0x10000u + (((w1 - 0xD800u) << 10) | (w2 - 0xDC00u));
+                            ++i;
+                        } else if (w1 >= 0xDC00u && w1 <= 0xDFFFu) {
+                            ok = false;
+                            break;
+                        } else {
+                            cp = w1;
+                        }
+
+                        if (!emit_cp(cp)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                } else if constexpr (std::same_as<CharT, wchar_t>) {
+                    if constexpr (sizeof(wchar_t) == 2) {
+                        return materialize_json_escaped(std::basic_string_view<char16_t> {reinterpret_cast<const char16_t*>(in.data()), in.size()});
+                    } else {
+                        return materialize_json_escaped(std::basic_string_view<char32_t> {reinterpret_cast<const char32_t*>(in.data()), in.size()});
+                    }
+                } else {
+                    static_assert(!sizeof(CharT), "unsupported CharT");
+                }
+
+                if (!ok) {
+                    set_err(ErrorCode::InvalidUnicode);
+                    return {};
+                }
+                out_len = static_cast<std::size_t>(dst - p);
+            }
+
+            p[out_len] = '\0';
+            return {p, out_len};
+        }
+
+        template <class CharT>
+        [[nodiscard]] UJSON_FORCEINLINE std::string_view materialize_text(std::basic_string_view<CharT> in) {
+            if (opt_.encoding == EncodingPolicy::Utf8)
+                return materialize_utf8_bytes(in);
+            return materialize_json_escaped(in);
+        }
+
         static bool normalize_slot(const NodeRef& self) {
             if (!self.slot_)
                 return false;
