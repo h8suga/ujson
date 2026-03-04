@@ -6181,6 +6181,10 @@ namespace ujson {
             if (!slot)
                 return {};
 
+            obj = self.raw();
+            if (!obj)
+                return {};
+
             Node* nn = make_from_value(std::forward<T>(v));
             if (!nn)
                 return {};
@@ -6670,6 +6674,10 @@ namespace ujson {
 
         Node** slot = b_->obj_append_slot(*this);
         if (!slot)
+            return {};
+
+        obj = raw();
+        if (!obj)
             return {};
 
         Node* nn = b_->make_value_node(Type::Null);

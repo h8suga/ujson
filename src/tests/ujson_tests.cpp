@@ -8,6 +8,7 @@
 #include <memory_resource>
 #include <random>
 #include <unordered_set>
+#include <utility>
 
 using namespace ujson;
 
@@ -946,6 +947,29 @@ TEST_CASE("Basic object insert and lookup", "[ujson][value_builder][basic]") {
     REQUIRE(root.get("c").raw()->data.num.i == 3);
 
     REQUIRE(b.ok());
+}
+
+TEST_CASE("Fold expression adds 100 elements", "[ujson][value_builder][fold]") {
+    ValueBuilder b;
+    auto root = b.root().set_object();
+
+    auto add_items = [&](auto seq) {
+        [&]<std::size_t... I>(std::index_sequence<I...>) {
+            (
+                [&] {
+                    auto added = root.add("k" + std::to_string(I), static_cast<std::int64_t>(I));
+                    REQUIRE(added.ok());
+                    REQUIRE(added.raw()->data.num.as_i64() == static_cast<std::int64_t>(I));
+                }(),
+                ...);
+        }(seq);
+    };
+
+    add_items(std::make_index_sequence<100> {});
+
+    REQUIRE(root.size() == 100);
+    for (std::size_t i = 0; i < 100; ++i)
+        REQUIRE(root.get("k" + std::to_string(i)).raw()->data.num.as_i64() == static_cast<std::int64_t>(i));
 }
 
 TEST_CASE("Insert or assign replaces existing value", "[ujson][value_builder][assign]") {
